@@ -126,6 +126,12 @@ where
         self.run_signal.notify_one();
     }
 
+    /// Return a cloned handle to the run signal so external tasks can trigger
+    /// an immediate PeerTaskManager loop iteration without an async call.
+    pub fn get_run_signal(&self) -> Arc<Notify> {
+        self.run_signal.clone()
+    }
+
     pub fn data(&self) -> D {
         self.data.clone()
     }

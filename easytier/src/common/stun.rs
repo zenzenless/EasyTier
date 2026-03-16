@@ -906,6 +906,8 @@ pub trait StunInfoCollectorTrait: Send + Sync {
     fn get_stun_info(&self) -> StunInfo;
     async fn get_udp_port_mapping(&self, local_port: u16) -> Result<SocketAddr, Error>;
     async fn get_tcp_port_mapping(&self, local_port: u16) -> Result<SocketAddr, Error>;
+    /// Trigger an immediate STUN re-detection. Default is a no-op.
+    fn update_stun_info(&self) {}
 }
 
 pub struct StunInfoCollector {
@@ -923,6 +925,10 @@ pub struct StunInfoCollector {
 
 #[async_trait::async_trait]
 impl StunInfoCollectorTrait for StunInfoCollector {
+    fn update_stun_info(&self) {
+        self.redetect_notify.notify_waiters();
+    }
+
     fn get_stun_info(&self) -> StunInfo {
         self.start_stun_routine();
 

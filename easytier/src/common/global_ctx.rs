@@ -97,6 +97,8 @@ pub struct GlobalCtx {
     stats_manager: Arc<StatsManager>,
 
     acl_filter: Arc<AclFilter>,
+
+    network_change_notify: Arc<tokio::sync::Notify>,
 }
 
 impl std::fmt::Debug for GlobalCtx {
@@ -187,6 +189,8 @@ impl GlobalCtx {
             stats_manager: Arc::new(StatsManager::new()),
 
             acl_filter: Arc::new(AclFilter::new()),
+
+            network_change_notify: Arc::new(tokio::sync::Notify::new()),
         }
     }
 
@@ -307,6 +311,22 @@ impl GlobalCtx {
             self.net_ns.clone(),
             arc_collector,
         )));
+    }
+
+    /// Notify all subsystems that the network has changed (e.g. woke from sleep).
+    /// This triggers an immediate STUN re-detection and IP cache refresh so that
+    /// direct-connection attempts use up-to-date address information.
+    pub fn notify_network_change(&self) {
+        tracing::info!("Network change event detected, refreshing STUN info and IP cache.");
+        self.stun_info_collection.lock().unwrap().update_stun_info();
+        if let Some(c) = self.ip_collector.lock().unwrap().as_ref() {
+            c.refresh_now();
+        }
+        self.network_change_notify.notify_waiters();
+    }
+
+    pub fn get_network_change_notify(&self) -> Arc<tokio::sync::Notify> {
+        self.network_change_notify.clone()
     }
 
     pub fn get_running_listeners(&self) -> Vec<url::Url> {

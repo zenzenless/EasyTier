@@ -196,6 +196,7 @@ pub struct IPCollector {
     collect_ip_task: Mutex<JoinSet<()>>,
     net_ns: NetNS,
     stun_info_collector: Arc<Box<dyn StunInfoCollectorTrait>>,
+    refresh_notify: Arc<tokio::sync::Notify>,
 }
 
 impl IPCollector {
@@ -205,7 +206,13 @@ impl IPCollector {
             collect_ip_task: Mutex::new(JoinSet::new()),
             net_ns,
             stun_info_collector: Arc::new(Box::new(stun_info_collector)),
+            refresh_notify: Arc::new(tokio::sync::Notify::new()),
         }
+    }
+
+    /// Trigger an immediate refresh of the cached IP list.
+    pub fn refresh_now(&self) {
+        self.refresh_notify.notify_waiters();
     }
 
     pub async fn collect_ip_addrs(&self) -> GetIpListResponse {
@@ -217,13 +224,18 @@ impl IPCollector {
             let net_ns = self.net_ns.clone();
             let stun_info_collector = self.stun_info_collector.clone();
             let cached_ip_list = self.cached_ip_list.clone();
+            let refresh_notify = self.refresh_notify.clone();
             task.spawn(async move {
                 let mut last_fetch_iface_time = std::time::Instant::now();
+                let mut force_refresh = false;
                 loop {
-                    if last_fetch_iface_time.elapsed().as_secs() > CACHED_IP_LIST_TIMEOUT_SEC {
+                    if force_refresh
+                        || last_fetch_iface_time.elapsed().as_secs() > CACHED_IP_LIST_TIMEOUT_SEC
+                    {
                         let ifaces = Self::do_collect_local_ip_addrs(net_ns.clone()).await;
                         *cached_ip_list.write().await = ifaces;
                         last_fetch_iface_time = std::time::Instant::now();
+                        force_refresh = false;
                     }
 
                     let stun_info = stun_info_collector.get_stun_info();
@@ -253,7 +265,12 @@ impl IPCollector {
                     } else {
                         3
                     };
-                    tokio::time::sleep(std::time::Duration::from_secs(sleep_sec)).await;
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(sleep_sec)) => {}
+                        _ = refresh_notify.notified() => {
+                            force_refresh = true;
+                        }
+                    }
                 }
             });
         }

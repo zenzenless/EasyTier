@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use anyhow::Context;
 use cidr::{IpCidr, Ipv4Inet};
+use rand::Rng;
 
 use futures::FutureExt;
 use tokio::sync::{Mutex, Notify};
@@ -723,10 +724,42 @@ impl Instance {
         tracing::debug!("nic ctx updated.");
     }
 
+    /// Detects system sleep/wake events via wall-clock jumps and calls
+    /// `GlobalCtx::notify_network_change()`. On Windows (and any other OS),
+    /// when the machine hibernates, `tokio::time::sleep` pauses while the system
+    /// clock advances. A large discrepancy signals that the system just woke up.
+    fn start_sleep_waker_detection(&self) {
+        let global_ctx = self.global_ctx.clone();
+        tokio::spawn(async move {
+            // How long each monotonic sleep interval lasts.
+            const CHECK_INTERVAL_SECS: u64 = 2;
+            // If the wall clock advanced by more than this relative to the
+            // monotonic sleep, we consider it a sleep/wake event.
+            const JUMP_THRESHOLD_SECS: u64 = 10;
+
+            let mut last_wall_time = std::time::SystemTime::now();
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(CHECK_INTERVAL_SECS)).await;
+                let now = std::time::SystemTime::now();
+                let elapsed_secs = now
+                    .duration_since(last_wall_time)
+                    .unwrap_or_default()
+                    .as_secs();
+                if elapsed_secs > CHECK_INTERVAL_SECS + JUMP_THRESHOLD_SECS {
+                    tracing::info!(
+                        elapsed_secs,
+                        "System clock jump detected (likely woke from sleep/hibernate). \
+                         Triggering network change refresh."
+                    );
+                    global_ctx.notify_network_change();
+                }
+                last_wall_time = now;
+            }
+        });
+    }
+
     // Warning, if there is an IP conflict in the network when using DHCP, the IP will be automatically changed.
-    fn check_dhcp_ip_conflict(&self) {
-        use rand::Rng;
-        let peer_manager_c = Arc::downgrade(&self.peer_manager.clone());
+    fn check_dhcp_ip_conflict(&self) {        let peer_manager_c = Arc::downgrade(&self.peer_manager.clone());
         let global_ctx_c = self.get_global_ctx();
         #[cfg(feature = "tun")]
         let nic_ctx = self.nic_ctx.clone();
@@ -936,6 +969,7 @@ impl Instance {
     }
 
     pub async fn run(&mut self) -> Result<(), Error> {
+        self.start_sleep_waker_detection();
         self.listener_manager
             .lock()
             .await

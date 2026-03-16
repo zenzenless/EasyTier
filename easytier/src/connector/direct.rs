@@ -85,8 +85,12 @@ struct DstListenerUrlBlackListItem(PeerId, String);
 struct DirectConnectorManagerData {
     global_ctx: ArcGlobalCtx,
     peer_manager: Arc<PeerManager>,
-    dst_listener_blacklist: timedmap::TimedMap<DstListenerUrlBlackListItem, ()>,
+    dst_listener_blacklist: std::sync::Mutex<timedmap::TimedMap<DstListenerUrlBlackListItem, ()>>,
     peer_black_list: timedmap::TimedMap<PeerId, ()>,
+    /// Incremented whenever the blacklist is cleared (e.g. on network change).
+    /// Running `do_try_direct_connect` tasks compare against their initial value
+    /// and exit early so `PeerTaskManager` can spawn fresh tasks.
+    blacklist_generation: std::sync::atomic::AtomicU64,
 }
 
 impl DirectConnectorManagerData {
@@ -94,8 +98,9 @@ impl DirectConnectorManagerData {
         Self {
             global_ctx,
             peer_manager,
-            dst_listener_blacklist: timedmap::TimedMap::new(),
+            dst_listener_blacklist: std::sync::Mutex::new(timedmap::TimedMap::new()),
             peer_black_list: timedmap::TimedMap::new(),
+            blacklist_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -233,13 +238,12 @@ impl DirectConnectorManagerData {
 
         tracing::debug!(?dst_peer_id, ?addr, "try_connect_to_ip start");
 
-        self.dst_listener_blacklist.cleanup();
-
-        if self
-            .dst_listener_blacklist
-            .contains(&DstListenerUrlBlackListItem(dst_peer_id, addr.clone()))
         {
-            return Err(Error::UrlInBlacklist);
+            let bl = self.dst_listener_blacklist.lock().unwrap();
+            bl.cleanup();
+            if bl.contains(&DstListenerUrlBlackListItem(dst_peer_id, addr.clone())) {
+                return Err(Error::UrlInBlacklist);
+            }
         }
 
         loop {
@@ -271,7 +275,7 @@ impl DirectConnectorManagerData {
                 backoff_idx += 1;
                 continue;
             } else {
-                self.dst_listener_blacklist.insert(
+                self.dst_listener_blacklist.lock().unwrap().insert(
                     DstListenerUrlBlackListItem(dst_peer_id, addr),
                     (),
                     std::time::Duration::from_secs(DIRECT_CONNECTOR_BLACKLIST_TIMEOUT_SEC),
@@ -510,6 +514,7 @@ impl DirectConnectorManagerData {
     async fn do_try_direct_connect(
         self: Arc<DirectConnectorManagerData>,
         dst_peer_id: PeerId,
+        initial_generation: u64,
     ) -> Result<(), Error> {
         let mut backoff =
             udp_hole_punch::BackOff::new(vec![1000, 2000, 2000, 5000, 5000, 10000, 30000, 60000]);
@@ -517,6 +522,20 @@ impl DirectConnectorManagerData {
         loop {
             if self.peer_black_list.contains(&dst_peer_id) {
                 return Err(anyhow::anyhow!("peer {} is blacklisted", dst_peer_id).into());
+            }
+
+            // Exit early when the blacklist was cleared (network changed) so
+            // PeerTaskManager can launch a fresh task with a clean slate.
+            if self
+                .blacklist_generation
+                .load(std::sync::atomic::Ordering::Relaxed)
+                != initial_generation
+            {
+                return Err(anyhow::anyhow!(
+                    "blacklist generation changed for peer {}, restarting task",
+                    dst_peer_id
+                )
+                .into());
             }
 
             if attempt > 0 {
@@ -609,7 +628,14 @@ impl PeerTaskLauncher for DirectConnectorLauncher {
         item: Self::CollectPeerItem,
     ) -> tokio::task::JoinHandle<Result<Self::TaskRet, anyhow::Error>> {
         let data = data.clone();
-        tokio::spawn(async move { data.do_try_direct_connect(item).await.map_err(Into::into) })
+        let gen = data
+            .blacklist_generation
+            .load(std::sync::atomic::Ordering::Relaxed);
+        tokio::spawn(async move {
+            data.do_try_direct_connect(item, gen)
+                .await
+                .map_err(Into::into)
+        })
     }
 
     async fn all_task_done(&self, _data: &Self::Data) {}
@@ -659,6 +685,24 @@ impl DirectConnectorManager {
 
     pub fn run_as_client(&mut self) {
         self.client.start();
+
+        // Listen for network-change events (e.g. system woke from sleep):
+        // clear the address blacklist so stale entries don't block retries, then
+        // bump the blacklist generation so any running do_try_direct_connect tasks
+        // exit and are restarted by PeerTaskManager with fresh state.
+        let data = self.data.clone();
+        let run_signal = self.client.get_run_signal();
+        let notify = self.global_ctx.get_network_change_notify();
+        self.tasks.spawn(async move {
+            loop {
+                notify.notified().await;
+                tracing::info!("DirectConnectorManager: network change detected, clearing address blacklist and restarting tasks.");
+                *data.dst_listener_blacklist.lock().unwrap() = timedmap::TimedMap::new();
+                data.blacklist_generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                run_signal.notify_one();
+            }
+        });
     }
 }
 
@@ -799,6 +843,8 @@ mod tests {
 
         assert!(data
             .dst_listener_blacklist
+            .lock()
+            .unwrap()
             .contains(&DstListenerUrlBlackListItem(
                 1,
                 "tcp://127.0.0.1:10222".parse().unwrap()
