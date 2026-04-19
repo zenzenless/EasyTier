@@ -49,8 +49,12 @@ impl WebhookConfig {
 pub struct ValidateTokenRequest {
     pub token: String,
     pub machine_id: String,
+    pub public_ip: Option<String>,
     pub hostname: String,
     pub version: String,
+    pub os_type: Option<String>,
+    pub os_version: Option<String>,
+    pub os_distribution: Option<String>,
     pub web_instance_id: Option<String>,
     pub web_instance_api_base_url: Option<String>,
 }
@@ -62,15 +66,26 @@ pub struct ValidateTokenResponse {
     pub pre_approved: bool,
     #[serde(default)]
     pub binding_version: u64,
-    pub network_config: Option<serde_json::Value>,
+    pub managed_network_configs: Vec<ManagedNetworkConfig>,
+    pub config_revision: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ManagedNetworkConfig {
+    pub instance_id: String,
+    pub network_config: serde_json::Value,
 }
 
 #[derive(Debug, Serialize)]
 pub struct NodeConnectedRequest {
     pub machine_id: String,
     pub token: String,
+    pub user_id: Option<i32>,
     pub hostname: String,
     pub version: String,
+    pub os_type: Option<String>,
+    pub os_version: Option<String>,
+    pub os_distribution: Option<String>,
     pub web_instance_id: Option<String>,
     pub binding_version: Option<u64>,
 }
@@ -78,6 +93,8 @@ pub struct NodeConnectedRequest {
 #[derive(Debug, Serialize)]
 pub struct NodeDisconnectedRequest {
     pub machine_id: String,
+    pub token: String,
+    pub user_id: Option<i32>,
     pub web_instance_id: Option<String>,
     pub binding_version: Option<u64>,
 }

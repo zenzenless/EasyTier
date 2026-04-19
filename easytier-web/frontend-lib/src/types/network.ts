@@ -14,6 +14,74 @@ export interface SecureModeConfig {
   local_public_key?: string
 }
 
+export enum AclProtocol {
+  Unspecified = 0,
+  TCP = 1,
+  UDP = 2,
+  ICMP = 3,
+  ICMPv6 = 4,
+  Any = 5,
+}
+
+export enum AclAction {
+  Noop = 0,
+  Allow = 1,
+  Drop = 2,
+}
+
+export enum AclChainType {
+  UnspecifiedChain = 0,
+  Inbound = 1,
+  Outbound = 2,
+  Forward = 3,
+}
+
+export interface AclRule {
+  name: string
+  description: string
+  priority: number
+  enabled: boolean
+  protocol: AclProtocol
+  ports: string[]
+  source_ips: string[]
+  destination_ips: string[]
+  source_ports: string[]
+  action: AclAction
+  rate_limit: number
+  burst_limit: number
+  stateful: boolean
+  source_groups: string[]
+  destination_groups: string[]
+}
+
+export interface AclChain {
+  name: string
+  chain_type: AclChainType
+  description: string
+  enabled: boolean
+  rules: AclRule[]
+  default_action: AclAction
+}
+
+export interface GroupIdentity {
+  group_name: string
+  group_secret: string
+}
+
+export interface GroupInfo {
+  declares: GroupIdentity[]
+  members: string[]
+}
+
+export interface AclV1 {
+  chains: AclChain[]
+  group?: GroupInfo
+}
+
+export interface Acl {
+  acl_v1?: AclV1
+}
+
 export interface NetworkConfig {
   instance_id: string
 
@@ -53,10 +121,12 @@ export interface NetworkConfig {
   disable_quic_input?: boolean
   disable_p2p?: boolean
   p2p_only?: boolean
+  lazy_p2p?: boolean
   bind_device?: boolean
   no_tun?: boolean
   enable_exit_node?: boolean
   relay_all_peer_rpc?: boolean
+  need_p2p?: boolean
   multi_thread?: boolean
   proxy_forward_by_system?: boolean
   disable_encryption?: boolean
@@ -76,12 +146,14 @@ export interface NetworkConfig {
   socks5_port: number
 
   mtu: number | null
+  instance_recv_bps_limit: number | null
   mapped_listeners: string[]
 
   enable_magic_dns?: boolean
   enable_private_mode?: boolean
 
   port_forwards: PortForwardConfig[]
+  acl?: Acl
 }
 
 export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
@@ -95,9 +167,8 @@ export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
     network_secret: '',
     credential_file: '',
 
-    networking_method: NetworkingMethod.PublicServer,
-
-    public_server_url: 'tcp://public.easytier.top:11010',
+    networking_method: NetworkingMethod.Manual,
+    public_server_url: '',
     peer_urls: [],
 
     proxy_cidrs: [],
@@ -125,10 +196,12 @@ export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
     disable_quic_input: false,
     disable_p2p: false,
     p2p_only: false,
+    lazy_p2p: false,
     bind_device: true,
     no_tun: false,
     enable_exit_node: false,
     relay_all_peer_rpc: false,
+    need_p2p: false,
     multi_thread: true,
     proxy_forward_by_system: false,
     disable_encryption: false,
@@ -143,11 +216,54 @@ export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
     enable_socks5: false,
     socks5_port: 1080,
     mtu: null,
+    instance_recv_bps_limit: null,
     mapped_listeners: [],
     enable_magic_dns: false,
     enable_private_mode: false,
     port_forwards: [],
+    acl: {
+      acl_v1: {
+        group: {
+          declares: [],
+          members: [],
+        },
+        chains: [],
+      },
+    },
   }
+}
+
+function cleanPeerUrls(urls: string[] | undefined): string[] {
+  return (urls ?? []).map((url) => url.trim()).filter((url) => url.length > 0)
+}
+
+export function normalizeNetworkConfig(config: NetworkConfig): NetworkConfig {
+  const normalized: NetworkConfig = {
+    ...config,
+    peer_urls: cleanPeerUrls(config.peer_urls),
+  }
+
+  const publicServerUrl = normalized.public_server_url?.trim() ?? ''
+
+  switch (normalized.networking_method) {
+    case NetworkingMethod.PublicServer:
+      normalized.peer_urls = publicServerUrl ? [publicServerUrl] : []
+      break
+    case NetworkingMethod.Manual:
+      break
+    case NetworkingMethod.Standalone:
+    default:
+      normalized.peer_urls = []
+      break
+  }
+
+  normalized.networking_method = NetworkingMethod.Manual
+  normalized.public_server_url = ''
+  return normalized
+}
+
+export function toBackendNetworkConfig(config: NetworkConfig): NetworkConfig {
+  return normalizeNetworkConfig(config)
 }
 
 export interface NetworkInstance {
