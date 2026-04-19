@@ -148,6 +148,7 @@ export interface NetworkConfig {
   mtu: number | null
   instance_recv_bps_limit: number | null
   mapped_listeners: string[]
+  rproxy_listeners: string[]
 
   enable_magic_dns?: boolean
   enable_private_mode?: boolean
@@ -218,6 +219,7 @@ export function DEFAULT_NETWORK_CONFIG(): NetworkConfig {
     mtu: null,
     instance_recv_bps_limit: null,
     mapped_listeners: [],
+    rproxy_listeners: [],
     enable_magic_dns: false,
     enable_private_mode: false,
     port_forwards: [],

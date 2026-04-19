@@ -228,6 +228,15 @@ struct NetworkOptions {
 
     #[arg(
         long,
+        env = "ET_RPROXY_LISTENERS",
+        value_delimiter = ',',
+        help = t!("core_clap.rproxy_listeners").to_string(),
+        num_args = 0..
+    )]
+    rproxy_listeners: Vec<String>,
+
+    #[arg(
+        long,
         env = "ET_NO_LISTENER",
         help = t!("core_clap.no_listener").to_string(),
         default_value = "false",
@@ -918,6 +927,37 @@ impl NetworkOptions {
                     .map(|s: url::Url| {
                         if s.port().is_none() {
                             errs.push(anyhow::anyhow!("mapped listener port is missing: {}", s));
+                        }
+                        s
+                    })
+                    .collect::<Vec<_>>(),
+            ));
+            if !errs.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "{}",
+                    errs.iter()
+                        .map(|x| format!("{}", x))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                ));
+            }
+        }
+
+        if !self.rproxy_listeners.is_empty() {
+            let mut errs = Vec::new();
+            cfg.set_rproxy_listeners(Some(
+                self.rproxy_listeners
+                    .iter()
+                    .map(|s| {
+                        s.parse()
+                            .with_context(|| {
+                                format!("rproxy listener is not a valid url: {}", s)
+                            })
+                            .unwrap()
+                    })
+                    .map(|s: url::Url| {
+                        if s.port().is_none() {
+                            errs.push(anyhow::anyhow!("rproxy listener port is missing: {}", s));
                         }
                         s
                     })
