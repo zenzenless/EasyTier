@@ -89,6 +89,13 @@ message NetworkConfig {
   optional bool lazy_p2p = 58;
   optional bool need_p2p = 59;
   optional uint64 instance_recv_bps_limit = 60;
+
+  // Listeners that are only accessible via a reverse proxy (e.g. frp, cloudflared tunnel).
+  // Connections accepted on these listeners will NOT be treated as directly-connected, which
+  // causes EasyTier to attempt P2P hole-punching to establish a real direct connection.
+  // These listener URLs will NOT be advertised to peers via the IP-list RPC so that peers
+  // do not try to directly reach them.
+  repeated string rproxy_listeners = 61;
 }
 
 message PortForwardConfig {
