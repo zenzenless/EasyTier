@@ -93,6 +93,9 @@ struct NoiseHandshakeResult {
 
     my_encrypt_algo: String,
     remote_encrypt_algo: String,
+
+    // Whether the server accepted this connection on an rproxy listener
+    accepted_as_rproxy: bool,
 }
 
 #[derive(Clone)]
@@ -995,6 +998,7 @@ impl PeerConn {
 
             my_encrypt_algo: self.my_encrypt_algo.clone(),
             remote_encrypt_algo: msg2_pb.server_encryption_algorithm.clone(),
+            accepted_as_rproxy: msg2_pb.accepted_as_rproxy,
         })
     }
 
@@ -1137,6 +1141,7 @@ impl PeerConn {
             a_conn_id_echo: msg1_pb.a_conn_id,
             secret_proof_32,
             server_encryption_algorithm: algo,
+            accepted_as_rproxy: self.is_rproxy,
         };
         self.send_noise_msg(
             msg2_pb,
@@ -1230,6 +1235,7 @@ impl PeerConn {
 
             my_encrypt_algo: self.my_encrypt_algo.clone(),
             remote_encrypt_algo: msg1_pb.client_encryption_algorithm.clone(),
+            accepted_as_rproxy: false,
         })
     }
 
@@ -1312,6 +1318,9 @@ impl PeerConn {
     pub async fn do_handshake_as_client(&mut self) -> Result<(), Error> {
         if self.is_secure_mode_enabled() {
             let noise = self.do_noise_handshake_as_client().await?;
+            if noise.accepted_as_rproxy {
+                self.is_rproxy = true;
+            }
             self.session_filter.set_session(noise.session.clone());
             self.session_filter.set_peer_id(noise.peer_id);
 
