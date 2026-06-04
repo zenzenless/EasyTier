@@ -548,6 +548,7 @@ impl MagicDnsServerInstance {
                 Ipv4Addr::new(127, 0, 0, 53).into(),
                 Ipv4Addr::new(127, 0, 0, 1).into(),
             ])
+            .disable_forwarding(true)
             .build()?;
         let mut dns_server = Server::new(dns_config);
         dns_server.run().await?;
