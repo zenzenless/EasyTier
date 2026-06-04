@@ -157,6 +157,9 @@ jobs:
 
       - uses: mlugg/setup-zig@v2
         if: ${{ contains(matrix.OS, 'ubuntu') }}
+        with:
+          version: 0.16.0
+          use-cache: true
 
       - uses: taiki-e/install-action@v2
         if: ${{ contains(matrix.OS, 'ubuntu') }}
@@ -178,7 +181,7 @@ jobs:
             BUILD=zigbuild
           fi
 
-          if [[ "$TARGET" =~ ^(riscv64|loongarch64|aarch64).*$ || "$TARGET" =~ windows ]]; then
+          if [[ "$TARGET" =~ ^(riscv64|loongarch64|aarch64).*$ || "$TARGET" =~ (freebsd|windows) ]]; then
             FEATURES="mimalloc"
           else
             FEATURES="jemalloc"
@@ -227,7 +230,7 @@ jobs:
               *)       UPX_ARCH="amd64" ;;
             esac
 
-            UPX_VERSION=5.1.1
+            UPX_VERSION=4.2.4
             UPX_PKG="upx-${UPX_VERSION}-${UPX_ARCH}_linux"
             curl -L "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/${UPX_PKG}.tar.xz" -s | tar xJvf -
             cp "${UPX_PKG}/upx" .

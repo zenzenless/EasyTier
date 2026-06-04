@@ -18,9 +18,10 @@ use crate::{
     instance::dns_server::DEFAULT_ET_DNS_ZONE,
     proto::{
         acl::Acl,
+        api::manage::ConfigSource as RpcConfigSource,
         common::{CompressionAlgoPb, PortForwardConfigPb, SecureModeConfig, SocketType},
     },
-    tunnel::generate_digest_from_str,
+    tunnel::{IpScheme, TunnelScheme, generate_digest_from_str},
 };
 
 use super::env_parser;
@@ -69,7 +70,41 @@ pub fn gen_default_flags() -> Flags {
         quic_listen_port: u32::MAX,
         need_p2p: false,
         instance_recv_bps_limit: u64::MAX,
+        disable_upnp: false,
+        disable_relay_data: false,
+        enable_udp_broadcast_relay: false,
+        socket_mark: None,
     }
+}
+
+fn mapped_listener_allows_implicit_port(url: &url::Url) -> bool {
+    TunnelScheme::try_from(url)
+        .ok()
+        .and_then(|scheme| IpScheme::try_from(scheme).ok())
+        .is_some()
+}
+
+pub fn validate_mapped_listener_url(url: &url::Url) -> Result<(), anyhow::Error> {
+    if url.port().is_none() && !mapped_listener_allows_implicit_port(url) {
+        anyhow::bail!("mapped listener port is missing: {}", url);
+    }
+
+    Ok(())
+}
+
+pub fn parse_mapped_listener_urls(
+    mapped_listeners: &[String],
+) -> Result<Vec<url::Url>, anyhow::Error> {
+    mapped_listeners
+        .iter()
+        .map(|s| {
+            let url: url::Url = s
+                .parse()
+                .with_context(|| format!("mapped listener is not a valid url: {}", s))?;
+            validate_mapped_listener_url(&url)?;
+            Ok(url)
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Display, EnumString, VariantArray)]
@@ -138,6 +173,15 @@ pub trait ConfigLoader: Send + Sync {
     fn get_ipv6(&self) -> Option<cidr::Ipv6Inet>;
     fn set_ipv6(&self, addr: Option<cidr::Ipv6Inet>);
 
+    fn get_ipv6_public_addr_provider(&self) -> bool;
+    fn set_ipv6_public_addr_provider(&self, enabled: bool);
+
+    fn get_ipv6_public_addr_auto(&self) -> bool;
+    fn set_ipv6_public_addr_auto(&self, enabled: bool);
+
+    fn get_ipv6_public_addr_prefix(&self) -> Option<cidr::Ipv6Cidr>;
+    fn set_ipv6_public_addr_prefix(&self, prefix: Option<cidr::Ipv6Cidr>);
+
     fn get_dhcp(&self) -> bool;
     fn set_dhcp(&self, dhcp: bool);
 
@@ -205,6 +249,11 @@ pub trait ConfigLoader: Send + Sync {
     }
     fn set_credential_file(&self, _path: Option<std::path::PathBuf>) {}
 
+    fn get_network_config_source(&self) -> ConfigSource {
+        ConfigSource::User
+    }
+    fn set_network_config_source(&self, _source: Option<ConfigSource>) {}
+
     fn dump(&self) -> String;
 }
 
@@ -222,6 +271,55 @@ pub struct NetworkIdentity {
     pub network_secret: Option<String>,
     #[serde(skip)]
     pub network_secret_digest: Option<NetworkSecretDigest>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigSource {
+    #[default]
+    User,
+    Webhook,
+}
+
+impl ConfigSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::Webhook => "webhook",
+        }
+    }
+
+    pub fn from_rpc(source: i32) -> Option<Self> {
+        match RpcConfigSource::try_from(source).ok() {
+            Some(RpcConfigSource::Webhook) => Some(Self::Webhook),
+            Some(RpcConfigSource::User) => Some(Self::User),
+            _ => None,
+        }
+    }
+
+    pub fn to_rpc(self) -> i32 {
+        match self {
+            Self::User => RpcConfigSource::User as i32,
+            Self::Webhook => RpcConfigSource::Webhook as i32,
+        }
+    }
+}
+
+impl std::str::FromStr for ConfigSource {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "user" => Ok(Self::User),
+            "webhook" => Ok(Self::Webhook),
+            other => Err(format!("unknown network config source: {other}")),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+struct ConfigSourceConfig {
+    source: ConfigSource,
 }
 
 #[derive(Eq, PartialEq, Hash)]
@@ -436,6 +534,9 @@ struct Config {
     instance_id: Option<uuid::Uuid>,
     ipv4: Option<String>,
     ipv6: Option<String>,
+    ipv6_public_addr_provider: Option<bool>,
+    ipv6_public_addr_auto: Option<bool>,
+    ipv6_public_addr_prefix: Option<String>,
     dhcp: Option<bool>,
     network_identity: Option<NetworkIdentity>,
     listeners: Option<Vec<url::Url>>,
@@ -468,6 +569,7 @@ struct Config {
     stun_servers_v6: Option<Vec<String>>,
 
     credential_file: Option<PathBuf>,
+    source: Option<ConfigSourceConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -482,9 +584,20 @@ impl Default for TomlConfigLoader {
 }
 
 impl TomlConfigLoader {
+    fn normalize_config_source(config: &mut Config) {
+        if matches!(
+            config.source.as_ref().map(|source| source.source),
+            Some(ConfigSource::User)
+        ) {
+            config.source = None;
+        }
+    }
+
     pub fn new_from_str(config_str: &str) -> Result<Self, anyhow::Error> {
         let mut config = toml::de::from_str::<Config>(config_str)
             .with_context(|| format!("failed to parse config file: {}", config_str))?;
+
+        Self::normalize_config_source(&mut config);
 
         config.flags_struct = Some(Self::gen_flags(config.flags.clone().unwrap_or_default()));
 
@@ -603,6 +716,43 @@ impl ConfigLoader for TomlConfigLoader {
 
     fn set_ipv6(&self, addr: Option<cidr::Ipv6Inet>) {
         self.config.lock().unwrap().ipv6 = addr.map(|addr| addr.to_string());
+    }
+
+    fn get_ipv6_public_addr_provider(&self) -> bool {
+        self.config
+            .lock()
+            .unwrap()
+            .ipv6_public_addr_provider
+            .unwrap_or_default()
+    }
+
+    fn set_ipv6_public_addr_provider(&self, enabled: bool) {
+        self.config.lock().unwrap().ipv6_public_addr_provider = Some(enabled);
+    }
+
+    fn get_ipv6_public_addr_auto(&self) -> bool {
+        self.config
+            .lock()
+            .unwrap()
+            .ipv6_public_addr_auto
+            .unwrap_or_default()
+    }
+
+    fn set_ipv6_public_addr_auto(&self, enabled: bool) {
+        self.config.lock().unwrap().ipv6_public_addr_auto = Some(enabled);
+    }
+
+    fn get_ipv6_public_addr_prefix(&self) -> Option<cidr::Ipv6Cidr> {
+        let locked_config = self.config.lock().unwrap();
+        locked_config
+            .ipv6_public_addr_prefix
+            .as_ref()
+            .and_then(|s| s.parse().ok())
+    }
+
+    fn set_ipv6_public_addr_prefix(&self, prefix: Option<cidr::Ipv6Cidr>) {
+        self.config.lock().unwrap().ipv6_public_addr_prefix =
+            prefix.map(|prefix| prefix.to_string());
     }
 
     fn get_dhcp(&self) -> bool {
@@ -869,6 +1019,23 @@ impl ConfigLoader for TomlConfigLoader {
         self.config.lock().unwrap().credential_file = path;
     }
 
+    fn get_network_config_source(&self) -> ConfigSource {
+        self.config
+            .lock()
+            .unwrap()
+            .source
+            .as_ref()
+            .map(|source| source.source)
+            .unwrap_or(ConfigSource::User)
+    }
+
+    fn set_network_config_source(&self, source: Option<ConfigSource>) {
+        self.config.lock().unwrap().source = source.and_then(|source| match source {
+            ConfigSource::User => None,
+            other => Some(ConfigSourceConfig { source: other }),
+        });
+    }
+
     fn dump(&self) -> String {
         let default_flags_json = serde_json::to_string(&gen_default_flags()).unwrap();
         let default_flags_hashmap =
@@ -890,6 +1057,7 @@ impl ConfigLoader for TomlConfigLoader {
         }
 
         let mut config = self.config.lock().unwrap().clone();
+        Self::normalize_config_source(&mut config);
         config.flags = Some(flag_map);
         if config.stun_servers == Some(StunInfoCollector::get_default_servers()) {
             config.stun_servers = None;
@@ -1096,6 +1264,57 @@ pub mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
+    fn socket_mark_config_file_roundtrip_none_some_and_zero() {
+        // Omitting the flag leaves socket_mark unset (None) -> SO_MARK untouched.
+        let cfg = TomlConfigLoader::new_from_str(
+            r#"
+[network_identity]
+network_name = "n"
+network_secret = "s"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.get_flags().socket_mark, None);
+
+        // socket_mark = 0 is a legitimate value distinct from "unset".
+        let cfg = TomlConfigLoader::new_from_str(
+            r#"
+[network_identity]
+network_name = "n"
+network_secret = "s"
+
+[flags]
+socket_mark = 0
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.get_flags().socket_mark, Some(0));
+
+        // A non-zero mark round-trips as Some(v).
+        let cfg = TomlConfigLoader::new_from_str(
+            r#"
+[network_identity]
+network_name = "n"
+network_secret = "s"
+
+[flags]
+socket_mark = 66
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.get_flags().socket_mark, Some(66));
+
+        // set_flags(None) must serialize back through gen_config without
+        // resurrecting a value (guards the gen_flags merge against dropping
+        // the key when the serialized default is null).
+        cfg.set_flags(Flags {
+            socket_mark: None,
+            ..cfg.get_flags()
+        });
+        assert_eq!(cfg.get_flags().socket_mark, None);
+    }
+
+    #[test]
     fn test_stun_servers_config() {
         let config = TomlConfigLoader::default();
         let stun_servers = config.get_stun_servers();
@@ -1126,6 +1345,162 @@ stun_servers = [
         assert_eq!(stun_servers[0], "stun.l.google.com:19302");
         assert_eq!(stun_servers[1], "stun1.l.google.com:19302");
         assert_eq!(stun_servers[2], "txt:stun.easytier.cn");
+    }
+
+    #[test]
+    fn test_network_config_source_toml_roundtrip() {
+        let config = TomlConfigLoader::default();
+        assert_eq!(config.get_network_config_source(), ConfigSource::User);
+
+        config.set_network_config_source(Some(ConfigSource::Webhook));
+        let dumped = config.dump();
+
+        assert!(dumped.contains("[source]"));
+        assert!(dumped.contains("source = \"webhook\""));
+
+        let loaded = TomlConfigLoader::new_from_str(&dumped).unwrap();
+        assert_eq!(loaded.get_network_config_source(), ConfigSource::Webhook);
+    }
+
+    #[test]
+    fn test_parse_mapped_listener_urls_allows_ws_without_port() {
+        let parsed = parse_mapped_listener_urls(&[
+            "ws://example.com".to_string(),
+            "wss://example.com/path".to_string(),
+        ])
+        .unwrap();
+
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].scheme(), "ws");
+        assert_eq!(parsed[0].port(), None);
+        assert_eq!(parsed[1].scheme(), "wss");
+        assert_eq!(parsed[1].port(), None);
+    }
+
+    #[test]
+    fn test_parse_mapped_listener_urls_allows_tcp_without_port() {
+        let parsed = parse_mapped_listener_urls(&["tcp://127.0.0.1".to_string()]).unwrap();
+
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].scheme(), "tcp");
+        assert_eq!(parsed[0].port(), None);
+    }
+
+    #[test]
+    fn test_parse_mapped_listener_urls_requires_port_for_non_ip_scheme() {
+        let err = parse_mapped_listener_urls(&["ring://peer-id".to_string()]).unwrap_err();
+
+        assert!(err.to_string().contains("mapped listener port is missing"));
+    }
+
+    #[test]
+    fn test_acl_toml_rule_uses_defaults_for_omitted_fields() {
+        use crate::proto::acl::{Action, ChainType, Protocol};
+
+        let config_str = r#"
+[[acl.acl_v1.chains]]
+name = "subnet_proxy_protect"
+chain_type = 3
+enabled = true
+default_action = 2
+
+[[acl.acl_v1.chains.rules]]
+name = "allow_my_devices"
+priority = 1000
+action = 1
+source_ips = ["10.172.192.2/32"]
+protocol = 5
+enabled = true
+"#;
+
+        let config = TomlConfigLoader::new_from_str(config_str).unwrap();
+        let acl = config.get_acl().unwrap();
+        let acl_v1 = acl.acl_v1.unwrap();
+        let chain = &acl_v1.chains[0];
+        let rule = &chain.rules[0];
+
+        assert_eq!(chain.chain_type, ChainType::Forward as i32);
+        assert_eq!(chain.default_action, Action::Drop as i32);
+        assert_eq!(rule.action, Action::Allow as i32);
+        assert_eq!(rule.protocol, Protocol::Any as i32);
+        assert_eq!(rule.source_ips, vec!["10.172.192.2/32"]);
+        assert!(rule.ports.is_empty());
+        assert!(rule.source_ports.is_empty());
+        assert!(rule.destination_ips.is_empty());
+        assert!(rule.source_groups.is_empty());
+        assert!(rule.destination_groups.is_empty());
+        assert_eq!(rule.rate_limit, 0);
+        assert_eq!(rule.burst_limit, 0);
+        assert!(!rule.stateful);
+    }
+
+    #[test]
+    fn test_acl_toml_group_can_omit_declares_or_members() {
+        let declares_only = r#"
+[acl.acl_v1.group]
+
+[[acl.acl_v1.group.declares]]
+group_name = "admin"
+group_secret = "admin-pw"
+"#;
+        let config = TomlConfigLoader::new_from_str(declares_only).unwrap();
+        let group = config.get_acl().unwrap().acl_v1.unwrap().group.unwrap();
+        assert_eq!(group.declares.len(), 1);
+        assert!(group.members.is_empty());
+
+        let members_only = r#"
+[acl.acl_v1.group]
+members = ["admin"]
+"#;
+        let config = TomlConfigLoader::new_from_str(members_only).unwrap();
+        let group = config.get_acl().unwrap().acl_v1.unwrap().group.unwrap();
+        assert!(group.declares.is_empty());
+        assert_eq!(group.members, vec!["admin"]);
+    }
+
+    #[test]
+    fn test_network_config_source_user_is_implicit() {
+        let config = TomlConfigLoader::default();
+        config.set_network_config_source(Some(ConfigSource::User));
+        let dumped = config.dump();
+
+        assert!(!dumped.contains("[source]"));
+
+        let loaded = TomlConfigLoader::new_from_str(&dumped).unwrap();
+        assert_eq!(loaded.get_network_config_source(), ConfigSource::User);
+
+        let explicit_user = TomlConfigLoader::new_from_str(
+            r#"
+[source]
+source = "user"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            explicit_user.get_network_config_source(),
+            ConfigSource::User
+        );
+        assert!(!explicit_user.dump().contains("[source]"));
+    }
+
+    #[test]
+    fn test_ipv6_public_addr_config_roundtrip() {
+        let config = TomlConfigLoader::default();
+        let prefix: cidr::Ipv6Cidr = "2001:db8:100::/64".parse().unwrap();
+
+        config.set_ipv6_public_addr_provider(true);
+        config.set_ipv6_public_addr_auto(true);
+        config.set_ipv6_public_addr_prefix(Some(prefix));
+
+        assert!(config.get_ipv6_public_addr_provider());
+        assert!(config.get_ipv6_public_addr_auto());
+        assert_eq!(config.get_ipv6_public_addr_prefix(), Some(prefix));
+
+        let dumped = config.dump();
+        let loaded = TomlConfigLoader::new_from_str(&dumped).unwrap();
+        assert!(loaded.get_ipv6_public_addr_provider());
+        assert!(loaded.get_ipv6_public_addr_auto());
+        assert_eq!(loaded.get_ipv6_public_addr_prefix(), Some(prefix));
     }
 
     #[tokio::test]

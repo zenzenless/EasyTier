@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use super::{FromUrl, TunnelInfo};
-use crate::tunnel::common::bind;
+use crate::tunnel::common::{apply_socket_mark, bind};
 use async_trait::async_trait;
 use futures::stream::FuturesUnordered;
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
@@ -17,6 +17,7 @@ const TCP_MTU_BYTES: usize = 2000;
 pub struct TcpTunnelListener {
     addr: url::Url,
     listener: Option<TcpListener>,
+    socket_mark: Option<u32>,
 }
 
 impl TcpTunnelListener {
@@ -24,7 +25,12 @@ impl TcpTunnelListener {
         TcpTunnelListener {
             addr,
             listener: None,
+            socket_mark: None,
         }
+    }
+
+    pub fn set_socket_mark(&mut self, socket_mark: Option<u32>) {
+        self.socket_mark = socket_mark;
     }
 
     async fn do_accept(&self) -> Result<Box<dyn Tunnel>, std::io::Error> {
@@ -61,7 +67,11 @@ impl TunnelListener for TcpTunnelListener {
         self.listener = None;
 
         let addr = SocketAddr::from_url(self.addr.clone(), IpVersion::Both).await?;
-        let listener = bind::<TcpListener>().addr(addr).only_v6(true).call()?;
+        let listener = bind::<TcpListener>()
+            .addr(addr)
+            .only_v6(true)
+            .maybe_socket_mark(self.socket_mark)
+            .call()?;
 
         self.addr
             .set_port(Some(listener.local_addr()?.port()))
@@ -129,6 +139,8 @@ pub struct TcpTunnelConnector {
 
     bind_addrs: Vec<SocketAddr>,
     ip_version: IpVersion,
+    resolved_addr: Option<SocketAddr>,
+    socket_mark: Option<u32>,
 }
 
 impl TcpTunnelConnector {
@@ -137,6 +149,8 @@ impl TcpTunnelConnector {
             addr,
             bind_addrs: vec![],
             ip_version: IpVersion::Both,
+            resolved_addr: None,
+            socket_mark: None,
         }
     }
 
@@ -145,7 +159,19 @@ impl TcpTunnelConnector {
         addr: SocketAddr,
     ) -> Result<Box<dyn Tunnel>, super::TunnelError> {
         tracing::info!(url = ?self.addr, ?addr, "connect tcp start, bind addrs: {:?}", self.bind_addrs);
-        let stream = TcpStream::connect(addr).await?;
+        let stream = if self.socket_mark.is_some() {
+            // SO_MARK requires applying the option on the socket before
+            // connect, so go through TcpSocket rather than TcpStream::connect.
+            let socket = if addr.is_ipv4() {
+                TcpSocket::new_v4()?
+            } else {
+                TcpSocket::new_v6()?
+            };
+            apply_socket_mark(&socket2::SockRef::from(&socket), self.socket_mark)?;
+            socket.connect(addr).await?
+        } else {
+            TcpStream::connect(addr).await?
+        };
         tracing::info!(url = ?self.addr, ?addr, "connect tcp succ");
         get_tunnel_with_tcp_stream(stream, self.addr.clone())
     }
@@ -158,7 +184,12 @@ impl TcpTunnelConnector {
 
         for bind_addr in self.bind_addrs.iter() {
             tracing::info!(?bind_addr, ?addr, "bind addr");
-            match bind::<TcpSocket>().addr(*bind_addr).only_v6(true).call() {
+            match bind::<TcpSocket>()
+                .addr(*bind_addr)
+                .only_v6(true)
+                .maybe_socket_mark(self.socket_mark)
+                .call()
+            {
                 Ok(socket) => futures.push(socket.connect(addr)),
                 Err(error) => {
                     tracing::error!(?bind_addr, ?addr, ?error, "bind addr fail");
@@ -175,7 +206,10 @@ impl TcpTunnelConnector {
 #[async_trait]
 impl super::TunnelConnector for TcpTunnelConnector {
     async fn connect(&mut self) -> Result<Box<dyn Tunnel>, TunnelError> {
-        let addr = SocketAddr::from_url(self.addr.clone(), self.ip_version).await?;
+        let addr = match self.resolved_addr {
+            Some(addr) => addr,
+            None => SocketAddr::from_url(self.addr.clone(), self.ip_version).await?,
+        };
         if self.bind_addrs.is_empty() {
             self.connect_with_default_bind(addr).await
         } else {
@@ -193,6 +227,14 @@ impl super::TunnelConnector for TcpTunnelConnector {
 
     fn set_ip_version(&mut self, ip_version: IpVersion) {
         self.ip_version = ip_version;
+    }
+
+    fn set_resolved_addr(&mut self, addr: SocketAddr) {
+        self.resolved_addr = Some(addr);
+    }
+
+    fn set_socket_mark(&mut self, socket_mark: Option<u32>) {
+        self.socket_mark = socket_mark;
     }
 }
 
@@ -292,6 +334,31 @@ mod tests {
             accepted_info.remote_addr,
             accepted_info.resolved_remote_addr,
         );
+    }
+
+    #[tokio::test]
+    async fn connector_uses_pre_resolved_addr_without_resolving_url() {
+        let mut listener = TcpTunnelListener::new("tcp://127.0.0.1:0".parse().unwrap());
+        listener.listen().await.unwrap();
+
+        let port = listener.local_url().port().unwrap();
+        let source_url: url::Url = format!("tcp://unresolvable.invalid:{port}")
+            .parse()
+            .unwrap();
+        let resolved_addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let mut connector = TcpTunnelConnector::new(source_url.clone());
+        connector.set_resolved_addr(resolved_addr);
+
+        let accept_task = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let tunnel = connector.connect().await.unwrap();
+        let _accepted_tunnel = accept_task.await.unwrap();
+
+        let info = tunnel.info().unwrap();
+        assert_eq!(info.remote_addr.unwrap().url, source_url.to_string());
+
+        let resolved_remote_addr: url::Url = info.resolved_remote_addr.unwrap().into();
+        assert_eq!(resolved_remote_addr.host_str(), Some("127.0.0.1"));
+        assert_eq!(resolved_remote_addr.port(), Some(port));
     }
 
     #[tokio::test]

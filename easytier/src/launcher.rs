@@ -1,4 +1,7 @@
-use crate::common::config::{ConfigFileControl, PortForwardConfig, process_secure_mode_cfg};
+use crate::common::config::{
+    ConfigFileControl, ConfigSource, PortForwardConfig, parse_mapped_listener_urls,
+    process_secure_mode_cfg,
+};
 use crate::proto::api::{self, manage};
 use crate::proto::rpc_types::controller::BaseController;
 use crate::rpc_service::InstanceRpcService;
@@ -434,6 +437,10 @@ impl NetworkInstance {
         &self.config_file_control
     }
 
+    pub fn get_network_config_source(&self) -> ConfigSource {
+        self.config.get_network_config_source()
+    }
+
     pub fn get_latest_error_msg(&self) -> Option<String> {
         if let Some(launcher) = self.launcher.as_ref() {
             launcher.error_msg.read().unwrap().clone()
@@ -667,22 +674,8 @@ impl NetworkConfig {
         }
 
         if !self.mapped_listeners.is_empty() {
-            cfg.set_mapped_listeners(Some(
-                self.mapped_listeners
-                    .iter()
-                    .map(|s| {
-                        s.parse()
-                            .with_context(|| format!("mapped listener is not a valid url: {}", s))
-                            .unwrap()
-                    })
-                    .map(|s: url::Url| {
-                        if s.port().is_none() {
-                            panic!("mapped listener port is missing: {}", s);
-                        }
-                        s
-                    })
-                    .collect(),
-            ));
+            let mapped_listeners = parse_mapped_listener_urls(&self.mapped_listeners)?;
+            cfg.set_mapped_listeners(Some(mapped_listeners));
         }
 
         if let Some(credential_file) = self
@@ -723,6 +716,24 @@ impl NetworkConfig {
             flags.use_smoltcp = use_smoltcp;
         }
 
+        if let Some(ipv6_public_addr_provider) = self.ipv6_public_addr_provider {
+            cfg.set_ipv6_public_addr_provider(ipv6_public_addr_provider);
+        }
+
+        if let Some(ipv6_public_addr_auto) = self.ipv6_public_addr_auto {
+            cfg.set_ipv6_public_addr_auto(ipv6_public_addr_auto);
+        }
+
+        if let Some(ipv6_public_addr_prefix) = self
+            .ipv6_public_addr_prefix
+            .as_ref()
+            .filter(|prefix| !prefix.is_empty())
+        {
+            cfg.set_ipv6_public_addr_prefix(Some(ipv6_public_addr_prefix.parse().with_context(
+                || format!("failed to parse ipv6 public address prefix: {ipv6_public_addr_prefix}"),
+            )?));
+        }
+
         if let Some(disable_ipv6) = self.disable_ipv6 {
             flags.enable_ipv6 = !disable_ipv6;
         }
@@ -757,6 +768,10 @@ impl NetworkConfig {
 
         if let Some(bind_device) = self.bind_device {
             flags.bind_device = bind_device;
+        }
+
+        if self.socket_mark.is_some() {
+            flags.socket_mark = self.socket_mark;
         }
 
         if let Some(no_tun) = self.no_tun {
@@ -801,6 +816,18 @@ impl NetworkConfig {
 
         if let Some(disable_udp_hole_punching) = self.disable_udp_hole_punching {
             flags.disable_udp_hole_punching = disable_udp_hole_punching;
+        }
+
+        if let Some(disable_upnp) = self.disable_upnp {
+            flags.disable_upnp = disable_upnp;
+        }
+
+        if let Some(disable_relay_data) = self.disable_relay_data {
+            flags.disable_relay_data = disable_relay_data;
+        }
+
+        if let Some(enable_udp_broadcast_relay) = self.enable_udp_broadcast_relay {
+            flags.enable_udp_broadcast_relay = enable_udp_broadcast_relay;
         }
 
         if let Some(disable_sym_hole_punching) = self.disable_sym_hole_punching {
@@ -867,6 +894,17 @@ impl NetworkConfig {
             result.virtual_ipv4 = Some(ipv4.address().to_string());
             result.network_length = Some(ipv4.network_length() as i32);
         }
+
+        if config.get_ipv6_public_addr_provider() != default_config.get_ipv6_public_addr_provider()
+        {
+            result.ipv6_public_addr_provider = Some(config.get_ipv6_public_addr_provider());
+        }
+        if config.get_ipv6_public_addr_auto() != default_config.get_ipv6_public_addr_auto() {
+            result.ipv6_public_addr_auto = Some(config.get_ipv6_public_addr_auto());
+        }
+        result.ipv6_public_addr_prefix = config
+            .get_ipv6_public_addr_prefix()
+            .map(|prefix| prefix.to_string());
 
         let peers = config.get_peers();
         result.networking_method = Some(NetworkingMethod::Manual as i32);
@@ -956,6 +994,7 @@ impl NetworkConfig {
         result.p2p_only = Some(flags.p2p_only);
         result.lazy_p2p = Some(flags.lazy_p2p);
         result.bind_device = Some(flags.bind_device);
+        result.socket_mark = flags.socket_mark;
         result.no_tun = Some(flags.no_tun);
         result.enable_exit_node = Some(flags.enable_exit_node);
         result.relay_all_peer_rpc = Some(flags.relay_all_peer_rpc);
@@ -965,6 +1004,9 @@ impl NetworkConfig {
         result.disable_encryption = Some(!flags.enable_encryption);
         result.disable_tcp_hole_punching = Some(flags.disable_tcp_hole_punching);
         result.disable_udp_hole_punching = Some(flags.disable_udp_hole_punching);
+        result.disable_upnp = Some(flags.disable_upnp);
+        result.disable_relay_data = Some(flags.disable_relay_data);
+        result.enable_udp_broadcast_relay = Some(flags.enable_udp_broadcast_relay);
         result.disable_sym_hole_punching = Some(flags.disable_sym_hole_punching);
         result.enable_magic_dns = Some(flags.accept_dns);
         result.mtu = Some(flags.mtu as i32);
@@ -1233,6 +1275,8 @@ mod tests {
                 flags.enable_encryption = rng.gen_bool(0.8);
                 flags.disable_tcp_hole_punching = rng.gen_bool(0.2);
                 flags.disable_udp_hole_punching = rng.gen_bool(0.2);
+                flags.disable_upnp = rng.gen_bool(0.2);
+                flags.enable_udp_broadcast_relay = rng.gen_bool(0.2);
                 flags.accept_dns = rng.gen_bool(0.6);
                 flags.mtu = rng.gen_range(1200..1500);
                 flags.private_mode = rng.gen_bool(0.3);

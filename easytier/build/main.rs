@@ -1,3 +1,6 @@
+mod rpc;
+
+use crate::rpc::ServiceGenerator;
 use cfg_aliases::cfg_aliases;
 use prost_wkt_build::{FileDescriptorSet, Message as _};
 #[cfg(target_os = "windows")]
@@ -191,8 +194,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .type_attribute("peer_rpc.RouteForeignNetworkSummary", "#[derive(Hash, Eq)]")
         .type_attribute("common.RpcDescriptor", "#[derive(Hash, Eq)]")
+        .type_attribute("acl.Acl", "#[serde(default)]")
+        .type_attribute("acl.AclV1", "#[serde(default)]")
+        .type_attribute("acl.Chain", "#[serde(default)]")
+        .type_attribute("acl.Rule", "#[serde(default)]")
+        .type_attribute("acl.GroupInfo", "#[serde(default)]")
         .field_attribute(".api.manage.NetworkConfig", "#[serde(default)]")
-        .service_generator(Box::new(easytier_rpc_build::ServiceGenerator::default()))
+        .service_generator(Box::new(ServiceGenerator::default()))
         .btree_map(["."])
         .skip_debug([".common.Ipv4Addr", ".common.Ipv6Addr", ".common.UUID"]);
 

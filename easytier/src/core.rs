@@ -1,24 +1,17 @@
 #![allow(dead_code)]
 
-use std::{
-    net::{IpAddr, SocketAddr},
-    path::PathBuf,
-    process::ExitCode,
-    sync::{Arc, atomic::AtomicBool},
-};
-
 use crate::{
     ShellType,
     common::{
         config::{
             ConfigFileControl, ConfigLoader, ConsoleLoggerConfig, EncryptionAlgorithm,
             FileLoggerConfig, LoggingConfigLoader, NetworkIdentity, PeerConfig, PortForwardConfig,
-            TomlConfigLoader, VpnPortalConfig, load_config_from_file, process_secure_mode_cfg,
+            TomlConfigLoader, VpnPortalConfig, load_config_from_file, parse_mapped_listener_urls,
+            process_secure_mode_cfg,
         },
         constants::EASYTIER_VERSION,
         log,
     },
-    defer,
     instance_manager::NetworkInstanceManager,
     launcher::add_proxy_network_to_config,
     proto::common::{CompressionAlgoPb, SecureModeConfig},
@@ -29,7 +22,14 @@ use crate::{
 use anyhow::Context;
 use cidr::IpCidr;
 use clap::{CommandFactory, Parser};
+use guarden::defer;
 use rust_i18n::t;
+use std::{
+    net::{IpAddr, SocketAddr},
+    path::PathBuf,
+    process::ExitCode,
+    sync::{Arc, atomic::AtomicBool},
+};
 use strum::VariantArray;
 use tokio::io::AsyncReadExt;
 
@@ -170,6 +170,31 @@ struct NetworkOptions {
         help = t!("core_clap.ipv6").to_string()
     )]
     ipv6: Option<String>,
+
+    #[arg(
+        long,
+        env = "ET_IPV6_PUBLIC_ADDR_PROVIDER",
+        help = t!("core_clap.ipv6_public_addr_provider").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    ipv6_public_addr_provider: Option<bool>,
+
+    #[arg(
+        long,
+        env = "ET_IPV6_PUBLIC_ADDR_AUTO",
+        help = t!("core_clap.ipv6_public_addr_auto").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    ipv6_public_addr_auto: Option<bool>,
+
+    #[arg(
+        long,
+        env = "ET_IPV6_PUBLIC_ADDR_PREFIX",
+        help = t!("core_clap.ipv6_public_addr_prefix").to_string()
+    )]
+    ipv6_public_addr_prefix: Option<String>,
 
     #[arg(
         short,
@@ -452,6 +477,24 @@ struct NetworkOptions {
 
     #[arg(
         long,
+        env = "ET_DISABLE_UPNP",
+        help = t!("core_clap.disable_upnp").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    disable_upnp: Option<bool>,
+
+    #[arg(
+        long,
+        env = "ET_ENABLE_UDP_BROADCAST_RELAY",
+        help = t!("core_clap.enable_udp_broadcast_relay").to_string(),
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    enable_udp_broadcast_relay: Option<bool>,
+
+    #[arg(
+        long,
         env = "ET_RELAY_ALL_PEER_RPC",
         help = t!("core_clap.relay_all_peer_rpc").to_string(),
         num_args = 0..=1,
@@ -489,6 +532,17 @@ struct NetworkOptions {
         help = t!("core_clap.bind_device").to_string()
     )]
     bind_device: Option<bool>,
+
+    // SO_MARK (fwmark) is a Linux-family kernel feature. Gate the flag out
+    // entirely on other targets so users on Windows/macOS/BSD don't see a
+    // `--socket-mark` they can't act on.
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[arg(
+        long,
+        env = "ET_SOCKET_MARK",
+        help = t!("core_clap.socket_mark").to_string()
+    )]
+    socket_mark: Option<u32>,
 
     #[arg(
         long,
@@ -735,55 +789,69 @@ struct RpcPortalOptions {
 }
 
 impl Cli {
+    fn gen_listeners(addr: SocketAddr) -> impl Iterator<Item = String> {
+        let dynamic = addr.port() == 0;
+        IpScheme::VARIANTS.iter().map(move |proto| {
+            let mut addr = addr;
+            if !dynamic {
+                addr.set_port(addr.port() + proto.port_offset());
+            }
+            format!("{}://{}", proto, addr)
+        })
+    }
+
     fn parse_listeners(no_listener: bool, listeners: Vec<String>) -> anyhow::Result<Vec<String>> {
         if no_listener || listeners.is_empty() {
             return Ok(vec![]);
         }
 
-        if listeners.len() == 1
-            && let Ok(port) = listeners[0].parse::<u16>()
-        {
-            let listeners = IpScheme::VARIANTS
-                .iter()
-                .map(|proto| {
-                    format!(
-                        "{}://0.0.0.0:{}",
-                        proto,
-                        if port == 0 {
-                            0
-                        } else {
-                            port + proto.port_offset()
-                        }
-                    )
-                })
-                .collect();
-            return Ok(listeners);
+        let mut parsed = vec![];
+
+        for l in listeners.into_iter() {
+            if let Ok(port) = l.parse::<u16>() {
+                parsed.extend(Self::gen_listeners(SocketAddr::new(
+                    "0.0.0.0".parse()?,
+                    port,
+                )));
+                continue;
+            }
+
+            if let Ok(ip) = l.trim_matches(|c| c == '[' || c == ']').parse::<IpAddr>() {
+                parsed.extend(Self::gen_listeners(SocketAddr::new(ip, 11010)));
+                continue;
+            }
+
+            if let Ok(addr) = l.parse::<SocketAddr>() {
+                parsed.extend(Self::gen_listeners(addr));
+                continue;
+            }
+
+            let (scheme, rest) = l.split_once(':').unwrap_or((&l, ""));
+            let Ok(scheme) = scheme.parse::<IpScheme>() else {
+                anyhow::bail!("invalid listener: {}", l);
+            };
+
+            if rest.is_empty() {
+                parsed.push(format!(
+                    "{}://0.0.0.0:{}",
+                    scheme,
+                    11010 + scheme.port_offset()
+                ));
+                continue;
+            }
+
+            if let Ok(port) = rest.parse::<u16>() {
+                parsed.push(format!("{}://0.0.0.0:{}", scheme, port));
+                continue;
+            }
+
+            if !l.parse::<url::Url>()?.has_authority() {
+                anyhow::bail!("invalid listener: {}", l);
+            }
+            parsed.push(l);
         }
 
-        listeners
-            .into_iter()
-            .map(|l| {
-                let l = l
-                    .parse::<url::Url>()
-                    .or_else(|_| url::Url::parse(&format!("{}:", l)))?;
-
-                if l.has_authority() {
-                    return Ok(l.to_string());
-                }
-
-                let scheme: IpScheme = l.scheme().parse()?;
-                let port = {
-                    let port = l.path();
-                    if port.is_empty() {
-                        11010 + scheme.port_offset()
-                    } else {
-                        port.parse::<u16>()
-                            .with_context(|| format!("invalid port: {}", port))?
-                    }
-                };
-                Ok(format!("{}://0.0.0.0:{}", scheme, port))
-            })
-            .collect()
+        Ok(parsed)
     }
 }
 
@@ -791,7 +859,7 @@ impl NetworkOptions {
     fn can_merge(
         &self,
         cfg: &TomlConfigLoader,
-        source: ConfigSource,
+        source: ConfigFileSource,
         explicit_config_file_count: usize,
         config_dir_file_count: usize,
     ) -> bool {
@@ -799,7 +867,7 @@ impl NetworkOptions {
             return false;
         }
 
-        if source == ConfigSource::CliConfigFile
+        if source == ConfigFileSource::CliConfigFile
             && explicit_config_file_count == 1
             && config_dir_file_count == 0
         {
@@ -810,7 +878,7 @@ impl NetworkOptions {
             return false;
         };
 
-        if source == ConfigSource::ConfigDir {
+        if source == ConfigFileSource::ConfigDir {
             return cfg.get_network_identity().network_name == *network_name;
         }
 
@@ -852,6 +920,20 @@ impl NetworkOptions {
             })?))
         }
 
+        if let Some(enabled) = self.ipv6_public_addr_provider {
+            cfg.set_ipv6_public_addr_provider(enabled);
+        }
+
+        if let Some(enabled) = self.ipv6_public_addr_auto {
+            cfg.set_ipv6_public_addr_auto(enabled);
+        }
+
+        if let Some(prefix) = &self.ipv6_public_addr_prefix {
+            cfg.set_ipv6_public_addr_prefix(Some(prefix.parse().with_context(|| {
+                format!("failed to parse ipv6 public address prefix: {}", prefix)
+            })?));
+        }
+
         if !self.peers.is_empty() {
             let mut peers = cfg.get_peers();
             peers.reserve(peers.len() + self.peers.len());
@@ -885,32 +967,7 @@ impl NetworkOptions {
         }
 
         if !self.mapped_listeners.is_empty() {
-            let mut errs = Vec::new();
-            cfg.set_mapped_listeners(Some(
-                self.mapped_listeners
-                    .iter()
-                    .map(|s| {
-                        s.parse()
-                            .with_context(|| format!("mapped listener is not a valid url: {}", s))
-                            .unwrap()
-                    })
-                    .map(|s: url::Url| {
-                        if s.port().is_none() {
-                            errs.push(anyhow::anyhow!("mapped listener port is missing: {}", s));
-                        }
-                        s
-                    })
-                    .collect::<Vec<_>>(),
-            ));
-            if !errs.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "{}",
-                    errs.iter()
-                        .map(|x| format!("{}", x))
-                        .collect::<Vec<_>>()
-                        .join("\n")
-                ));
-            }
+            cfg.set_mapped_listeners(Some(parse_mapped_listener_urls(&self.mapped_listeners)?));
         }
 
         for n in self.proxy_networks.iter() {
@@ -1082,6 +1139,10 @@ impl NetworkOptions {
             .into();
         }
         f.bind_device = self.bind_device.unwrap_or(f.bind_device);
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        {
+            f.socket_mark = self.socket_mark.or(f.socket_mark);
+        }
         f.enable_kcp_proxy = self.enable_kcp_proxy.unwrap_or(f.enable_kcp_proxy);
         f.disable_kcp_input = self.disable_kcp_input.unwrap_or(f.disable_kcp_input);
         f.enable_quic_proxy = self.enable_quic_proxy.unwrap_or(f.enable_quic_proxy);
@@ -1103,7 +1164,13 @@ impl NetworkOptions {
         f.enable_relay_foreign_network_quic = self
             .enable_relay_foreign_network_quic
             .unwrap_or(f.enable_relay_foreign_network_quic);
-        f.disable_sym_hole_punching = self.disable_sym_hole_punching.unwrap_or(false);
+        f.disable_sym_hole_punching = self
+            .disable_sym_hole_punching
+            .unwrap_or(f.disable_sym_hole_punching);
+        f.disable_upnp = self.disable_upnp.unwrap_or(f.disable_upnp);
+        f.enable_udp_broadcast_relay = self
+            .enable_udp_broadcast_relay
+            .unwrap_or(f.enable_udp_broadcast_relay);
         // Configure tld_dns_zone: use provided value if set
         if let Some(tld_dns_zone) = &self.tld_dns_zone {
             f.tld_dns_zone = tld_dns_zone.clone();
@@ -1138,7 +1205,7 @@ impl NetworkOptions {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ConfigSource {
+enum ConfigFileSource {
     CliConfigFile,
     ConfigDir,
 }
@@ -1298,7 +1365,10 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
     let _web_client = if let Some(config_server_url_s) = cli.config_server.as_ref() {
         let wc = web_client::run_web_client(
             config_server_url_s,
-            cli.machine_id.clone(),
+            crate::common::MachineIdOptions {
+                explicit_machine_id: cli.machine_id.clone(),
+                state_dir: None,
+            },
             cli.network_options.hostname.clone(),
             cli.network_options.secure_mode.unwrap_or(false),
             manager.clone(),
@@ -1330,7 +1400,7 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
     let mut config_files = if let Some(v) = cli.config_file {
         v.iter()
             .cloned()
-            .map(|path| (path, ConfigSource::CliConfigFile))
+            .map(|path| (path, ConfigFileSource::CliConfigFile))
             .collect()
     } else {
         vec![]
@@ -1353,7 +1423,7 @@ async fn run_main(cli: Cli) -> anyhow::Result<()> {
                 continue;
             }
             config_dir_file_count += 1;
-            config_files.push((path, ConfigSource::ConfigDir));
+            config_files.push((path, ConfigFileSource::ConfigDir));
         }
     }
     let config_file_count = config_files.len();
@@ -1583,4 +1653,92 @@ async fn validate_config(cli: &Cli) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_listeners() {
+        type IpSchemeMap = fn(&IpScheme) -> String;
+
+        let cases: [(&str, IpSchemeMap); _] = [
+            ("0", |s| format!("{}://0.0.0.0:0", s)),
+            ("11010", |s| {
+                format!("{}://0.0.0.0:{}", s, 11010 + s.port_offset())
+            }),
+            ("1.1.1.1", |s| {
+                format!("{}://1.1.1.1:{}", s, 11010 + s.port_offset())
+            }),
+            ("1.1.1.1:50000", |s| {
+                format!("{}://1.1.1.1:{}", s, 50000 + s.port_offset())
+            }),
+            ("[::1]", |s| {
+                format!("{}://[::1]:{}", s, 11010 + s.port_offset())
+            }),
+            ("[::1]:50000", |s| {
+                format!("{}://[::1]:{}", s, 50000 + s.port_offset())
+            }),
+        ];
+
+        for (input, output) in cases {
+            assert_eq!(
+                Cli::parse_listeners(false, vec![input.to_string()]).unwrap(),
+                IpScheme::VARIANTS.iter().map(output).collect::<Vec<_>>()
+            );
+        }
+
+        let input = cases.iter().map(|(i, _)| i.to_string()).collect::<Vec<_>>();
+        let output = cases
+            .iter()
+            .flat_map(|(_, o)| IpScheme::VARIANTS.iter().map(o))
+            .collect::<Vec<_>>();
+        assert_eq!(Cli::parse_listeners(false, input).unwrap(), output);
+
+        let cases: [(IpSchemeMap, IpSchemeMap); _] = [
+            (
+                |s| format!("{}", s),
+                |s| format!("{}://0.0.0.0:{}", s, 11010 + s.port_offset()),
+            ),
+            (
+                |s| format!("{}:50000", s),
+                |s| format!("{}://0.0.0.0:50000", s),
+            ),
+            (
+                |s| format!("{}://1.1.1.1:50000", s),
+                |s| format!("{}://1.1.1.1:50000", s),
+            ),
+        ];
+
+        for (input, output) in cases {
+            assert_eq!(
+                Cli::parse_listeners(
+                    false,
+                    IpScheme::VARIANTS.iter().map(input).collect::<Vec<_>>(),
+                )
+                .unwrap(),
+                IpScheme::VARIANTS.iter().map(output).collect::<Vec<_>>()
+            );
+        }
+
+        let input = cases
+            .iter()
+            .flat_map(|(i, _)| IpScheme::VARIANTS.iter().map(i))
+            .collect::<Vec<_>>();
+        let output = cases
+            .iter()
+            .flat_map(|(_, o)| IpScheme::VARIANTS.iter().map(o))
+            .collect::<Vec<_>>();
+        assert_eq!(Cli::parse_listeners(false, input).unwrap(), output);
+
+        let cases = ["tcp://[::1", "xxx", "tcp:/abc", "tcp:abc"];
+        for input in cases {
+            assert!(
+                Cli::parse_listeners(false, vec![input.to_string()]).is_err(),
+                "input: {}",
+                input
+            );
+        }
+    }
 }

@@ -463,6 +463,7 @@ pub struct WgTunnelListener {
     wg_peer_map: Arc<DashMap<SocketAddr, Arc<WgPeer>>>,
 
     tasks: JoinSet<()>,
+    socket_mark: Option<u32>,
 }
 
 impl WgTunnelListener {
@@ -479,7 +480,12 @@ impl WgTunnelListener {
             wg_peer_map: Arc::new(DashMap::new()),
 
             tasks: JoinSet::new(),
+            socket_mark: None,
         }
+    }
+
+    pub fn set_socket_mark(&mut self, socket_mark: Option<u32>) {
+        self.socket_mark = socket_mark;
     }
 
     fn get_udp_socket(&self) -> Arc<UdpSocket> {
@@ -561,6 +567,7 @@ impl TunnelListener for WgTunnelListener {
                 .addr(addr)
                 .only_v6(true)
                 .maybe_dev(tunnel_url.bind_dev())
+                .maybe_socket_mark(self.socket_mark)
                 .call()?,
         ));
         self.addr
@@ -598,6 +605,8 @@ pub struct WgTunnelConnector {
 
     bind_addrs: Vec<SocketAddr>,
     ip_version: IpVersion,
+    resolved_addr: Option<SocketAddr>,
+    socket_mark: Option<u32>,
 }
 
 impl Debug for WgTunnelConnector {
@@ -617,6 +626,8 @@ impl WgTunnelConnector {
             udp: None,
             bind_addrs: vec![],
             ip_version: IpVersion::Both,
+            resolved_addr: None,
+            socket_mark: None,
         }
     }
 
@@ -693,6 +704,7 @@ impl WgTunnelConnector {
             .addr("[::]:0".parse().unwrap())
             .dev(BindDev::Disabled)
             .only_v6(true)
+            .maybe_socket_mark(self.socket_mark)
             .call()?;
         Self::connect_with_socket(self.addr.clone(), self.config.clone(), socket, addr).await
     }
@@ -702,7 +714,10 @@ impl WgTunnelConnector {
 impl super::TunnelConnector for WgTunnelConnector {
     #[tracing::instrument]
     async fn connect(&mut self) -> Result<Box<dyn Tunnel>, TunnelError> {
-        let addr = SocketAddr::from_url(self.addr.clone(), self.ip_version).await?;
+        let addr = match self.resolved_addr {
+            Some(addr) => addr,
+            None => SocketAddr::from_url(self.addr.clone(), self.ip_version).await?,
+        };
 
         if addr.is_ipv6() {
             return self.connect_with_ipv6(addr).await;
@@ -716,7 +731,12 @@ impl super::TunnelConnector for WgTunnelConnector {
         let futures = FuturesUnordered::new();
         for bind_addr in bind_addrs.into_iter() {
             tracing::info!(?bind_addr, ?addr, "bind addr");
-            match bind().addr(bind_addr).only_v6(true).call() {
+            match bind()
+                .addr(bind_addr)
+                .only_v6(true)
+                .maybe_socket_mark(self.socket_mark)
+                .call()
+            {
                 Ok(socket) => futures.push(Self::connect_with_socket(
                     self.addr.clone(),
                     self.config.clone(),
@@ -743,6 +763,14 @@ impl super::TunnelConnector for WgTunnelConnector {
 
     fn set_ip_version(&mut self, ip_version: IpVersion) {
         self.ip_version = ip_version;
+    }
+
+    fn set_resolved_addr(&mut self, addr: SocketAddr) {
+        self.resolved_addr = Some(addr);
+    }
+
+    fn set_socket_mark(&mut self, socket_mark: Option<u32>) {
+        self.socket_mark = socket_mark;
     }
 }
 
